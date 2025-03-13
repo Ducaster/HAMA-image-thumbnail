@@ -1,84 +1,128 @@
-import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
+import {
+  SQSClient,
+  ReceiveMessageCommand,
+  DeleteMessageCommand,
+} from '@aws-sdk/client-sqs';
 import {
   S3Client,
-  GetObjectCommand,
   PutObjectCommand,
+  GetObjectCommand,
 } from '@aws-sdk/client-s3';
 import * as sharp from 'sharp';
 import axios from 'axios';
-import * as dotenv from 'dotenv';
-
-dotenv.config();
 
 @Injectable()
-export class ThumbnailService {
-  private s3Original: S3Client;
-  private s3Thumbnail: S3Client;
-  private originalBucket: string;
-  private thumbnailBucket: string;
+export class ThumbnailService implements OnModuleInit {
+  private sqsClient = new SQSClient({
+    region: process.env.AWS_ORIGINAL_REGION,
+  });
+  private s3Client = new S3Client({ region: process.env.AWS_ORIGINAL_REGION });
 
-  constructor() {
-    this.s3Original = new S3Client({
-      region: process.env.AWS_ORIGINAL_REGION,
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID ?? 'defaultAccessKeyId',
-        secretAccessKey:
-          process.env.AWS_SECRET_ACCESS_KEY ?? 'defaultSecretAccessKey',
-      },
-    });
+  async onModuleInit() {
+    console.log('🔄 Starting SQS message processing...');
+    this.startMessageProcessing();
+  }
 
-    this.s3Thumbnail = new S3Client({
-      region: process.env.AWS_THUMBNAIL_REGION,
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID ?? 'defaultAccessKeyId',
-        secretAccessKey:
-          process.env.AWS_SECRET_ACCESS_KEY ?? 'defaultSecretAccessKey',
-      },
-    });
+  private async startMessageProcessing() {
+    while (true) {
+      try {
+        const { Messages } = await this.sqsClient.send(
+          new ReceiveMessageCommand({
+            QueueUrl: process.env.SQS_QUEUE_URL,
+            MaxNumberOfMessages: 1,
+            WaitTimeSeconds: 20,
+          }),
+        );
 
-    this.originalBucket =
-      process.env.AWS_ORIGINAL_BUCKET_NAME ?? 'defaultOriginalBucketName';
-    this.thumbnailBucket =
-      process.env.AWS_THUMBNAIL_BUCKET_NAME ?? 'defaultThumbnailBucketName';
+        if (!Messages || Messages.length === 0) continue;
+
+        for (const message of Messages) {
+          if (!message.Body) continue;
+
+          const { imageKey } = JSON.parse(message.Body);
+
+          // S3에서 원본 이미지 가져오기
+          const { Body } = await this.s3Client.send(
+            new GetObjectCommand({
+              Bucket: process.env.AWS_ORIGINAL_BUCKET_NAME,
+              Key: imageKey,
+            }),
+          );
+
+          if (!Body) continue;
+
+          // 스트림을 버퍼로 변환
+          const chunks: Uint8Array[] = [];
+          for await (const chunk of Body as unknown as AsyncIterable<Uint8Array>) {
+            chunks.push(chunk);
+          }
+          const imageBuffer = Buffer.concat(chunks);
+
+          // 썸네일 생성
+          const thumbnailBuffer = await sharp(imageBuffer)
+            .resize(200, 200)
+            .toBuffer();
+
+          // 썸네일 S3에 업로드
+          await this.s3Client.send(
+            new PutObjectCommand({
+              Bucket: process.env.AWS_THUMBNAIL_BUCKET_NAME,
+              Key: `thumbnails/${imageKey}`,
+              Body: thumbnailBuffer,
+              ContentType: 'image/jpeg',
+            }),
+          );
+
+          // 처리 완료된 메시지 삭제
+          await this.sqsClient.send(
+            new DeleteMessageCommand({
+              QueueUrl: process.env.SQS_QUEUE_URL,
+              ReceiptHandle: message.ReceiptHandle,
+            }),
+          );
+
+          console.log(`✅ Successfully processed thumbnail for: ${imageKey}`);
+        }
+      } catch (error) {
+        console.error('Error processing message:', error);
+        // 에러가 발생해도 계속 실행
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
   }
 
   async generateThumbnail(imageUrl: string): Promise<string> {
     try {
-      // 🔹 1️⃣ 원본 이미지 다운로드
+      // 이미지 다운로드
       const response = await axios.get(imageUrl, {
         responseType: 'arraybuffer',
       });
-
       const imageBuffer = Buffer.from(response.data);
 
-      // 🔹 2️⃣ sharp로 썸네일 생성 (300x300, JPEG 압축)
+      // 썸네일 생성
       const thumbnailBuffer = await sharp(imageBuffer)
-        .resize({ width: 300 })
-        .jpeg({ quality: 80 })
+        .resize(200, 200)
         .toBuffer();
 
-      // 🔹 3️⃣ S3에 업로드할 키 설정
-      const imageKey = imageUrl.split('/').pop();
-      const thumbnailKey = `thumbnails/${imageKey}`;
+      // 파일명 생성 (URL에서 유니크한 이름 추출)
+      const fileName = `${Date.now()}-${Math.random().toString(36).substring(7)}.jpg`;
 
-      // 🔹 4️⃣ 새 S3 버킷에 업로드
-      await this.s3Thumbnail.send(
+      // S3에 업로드
+      await this.s3Client.send(
         new PutObjectCommand({
-          Bucket: this.thumbnailBucket,
-          Key: thumbnailKey,
+          Bucket: process.env.AWS_THUMBNAIL_BUCKET_NAME,
+          Key: `thumbnails/${fileName}`,
           Body: thumbnailBuffer,
           ContentType: 'image/jpeg',
         }),
       );
 
-      // 🔹 5️⃣ 새 썸네일 URL 반환
-      return `https://${this.thumbnailBucket}.s3.${process.env.AWS_THUMBNAIL_REGION}.amazonaws.com/${thumbnailKey}`;
+      // 썸네일 URL 반환
+      return `https://${process.env.AWS_THUMBNAIL_BUCKET_NAME}.s3.${process.env.AWS_THUMBNAIL_REGION}.amazonaws.com/thumbnails/${fileName}`;
     } catch (error) {
-      console.error(`❌ Thumbnail generation failed`, error);
-      throw new HttpException(
-        'Thumbnail generation failed',
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
+      console.error('썸네일 생성 중 에러:', error);
+      throw error;
     }
   }
 }
